@@ -193,32 +193,59 @@ Stops one shell, starts the other, flips the mode file and reloads Hyprland. Exp
 
 ```bash
 #!/usr/bin/env bash
-# shell-switch: dms | end4 | status
+# shell-switch: dms | end4 | status   (FORCE=1 stops the fork even during an update)
 FORK=end4-pC
 export ILLOGICAL_IMPULSE_VIRTUAL_ENV="$HOME/.local/state/quickshell/.venv"
 MODE="$HOME/.config/hypr/end4/mode"
 
+# every end4-pC instance, found by config path (its command line can be a bare "quickshell")
+fork_pids() {
+  qs list --all 2>/dev/null | awk -v f="/$FORK/" "/Process ID:/ {pid=\$3} /Config path:/ && index(\$0,f) {print pid}"
+}
+
+updating() {
+  local p
+  for p in $(fork_pids); do
+    pstree -p "$p" 2>/dev/null | grep -qE "(yay|paru|makepkg|pacman)\(" && return 0
+  done
+  return 1
+}
+
 stop_fork() {
-  pkill -f "^qs .*$FORK" 2>/dev/null
+  local pids i
+  if updating && [ "${FORCE:-0}" != 1 ]; then
+    echo "an update (yay/makepkg/pacman) is running under end4-pC. Finish it, or run: env FORCE=1 shell-switch $1"
+    exit 1
+  fi
+  pids="$(fork_pids)"
+  [ -n "$pids" ] && kill $pids 2>/dev/null
+  pkill -f "$FORK/scripts/" 2>/dev/null
+  pkill -f "notify-send.*Wallpaper switcher" 2>/dev/null
   for i in 1 2 3 4 5 6 7 8 9 10; do
-    pgrep -f "^qs .*$FORK" > /dev/null || return 0
+    [ -z "$(fork_pids)" ] && return 0
     sleep 0.5
   done
-  pkill -9 -f "^qs .*$FORK" 2>/dev/null
+  pids="$(fork_pids)"
+  [ -n "$pids" ] && kill -9 $pids 2>/dev/null
+  sleep 0.5
+  if [ -n "$(fork_pids)" ]; then
+    echo "warning: end4-pC still running:"
+    qs list --all | grep -B3 -A3 "/$FORK/"
+  fi
 }
 
 case "${1:-status}" in
   end4)
+    stop_fork end4
     echo end4 > "$MODE"
     systemctl --user stop dms
-    stop_fork
     nohup qs -c "$FORK" > /dev/null 2>&1 &
     disown
     hyprctl reload > /dev/null
     echo "-> end4-pC"
     ;;
   dms)
-    stop_fork
+    stop_fork dms
     echo dms > "$MODE"
     hyprctl reload > /dev/null
     systemctl --user start dms
@@ -227,7 +254,7 @@ case "${1:-status}" in
   status)
     echo "mode file:   $(cat "$MODE" 2>/dev/null || echo dms)"
     echo "dms.service: $(systemctl --user is-active dms)"
-    if pgrep -f "^qs -c $FORK" > /dev/null; then echo "end4-pC:     active"; else echo "end4-pC:     inactive"; fi
+    if [ -n "$(fork_pids)" ]; then echo "end4-pC:     active (pid $(fork_pids | paste -sd,))"; else echo "end4-pC:     inactive"; fi
     ;;
   *)
     echo "usage: shell-switch dms|end4|status"
@@ -241,7 +268,9 @@ esac
 **Why it works this way**
 
 - `systemctl --user stop dms`, not `dms kill`: systemd restarts a killed DMS within seconds.
-- `pkill -f "^qs .*end4-pC"` only matches `qs` processes, so an editor with a file from that folder is not killed. It also catches the first-run `welcome.qml` process.
+- The fork is found with `qs list --all` (by config path), not by process name. It can run as a bare `/usr/bin/quickshell` with no arguments, which `pkill -f qs` never matches.
+- It refuses to stop the fork while `yay`, `makepkg` or `pacman` runs inside the fork's terminal (that terminal dies with the shell). `FORCE=1` overrides it.
+- It also stops the fork's `scripts/` helpers and the "Wallpaper switcher" notification they wait on, which otherwise stay behind as orphans.
 - The wait loop lets the fork exit before DMS starts, so they do not fight over the notification daemon.
 
 **Debug**
@@ -465,6 +494,7 @@ if mode == "end4" then
     "hyprland.rules",
     "hyprland.colors",
     "hyprland.shellOverrides.main",
+    "end4.keys",
   }) do
     local ok, err = pcall(require, m)
     if log then log:write(m .. ": " .. (ok and "ok" or tostring(err)) .. "\n") end
@@ -472,6 +502,41 @@ if mode == "end4" then
   if log then log:close() end
 end
 ```
+
+### `~/.config/hypr/end4/keys.lua`: media and brightness keys (end4 mode only)
+
+DMS's own binds for these keys call `dms ipc call …`, so they do nothing while DMS is stopped. This file is loaded by `mode.lua` (add `"end4.keys"` to its module list) and only in `end4` mode, so DMS mode keeps its own binds and nothing fires twice.
+
+```lua
+-- end4 mode only: media and brightness keys that work without the DMS shell
+for _, k in ipairs({
+  "XF86AudioMute", "XF86AudioLowerVolume", "XF86AudioRaiseVolume", "XF86AudioMicMute",
+  "XF86AudioPlay", "XF86AudioPause", "XF86AudioPrev", "XF86AudioNext",
+  "XF86MonBrightnessDown", "XF86MonBrightnessUp",
+}) do
+  pcall(hl.unbind, k)
+end
+local rep = { locked = true, repeating = true }
+local ipc = "qs -c end4-pC ipc call"
+hl.bind("XF86AudioRaiseVolume", hl.dsp.exec_cmd("wpctl set-volume -l 1.5 @DEFAULT_AUDIO_SINK@ 3%+"), rep)
+hl.bind("XF86AudioLowerVolume", hl.dsp.exec_cmd("wpctl set-volume @DEFAULT_AUDIO_SINK@ 3%-"), rep)
+hl.bind("XF86AudioMute", hl.dsp.exec_cmd("wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle"), { locked = true })
+hl.bind("XF86AudioMicMute", hl.dsp.exec_cmd("wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle"), { locked = true })
+hl.bind("XF86AudioPlay", hl.dsp.exec_cmd("playerctl play-pause"), { locked = true })
+hl.bind("XF86AudioPause", hl.dsp.exec_cmd("playerctl play-pause"), { locked = true })
+hl.bind("XF86AudioPrev", hl.dsp.exec_cmd("playerctl previous"), { locked = true })
+hl.bind("XF86AudioNext", hl.dsp.exec_cmd("playerctl next"), { locked = true })
+hl.bind("XF86MonBrightnessUp", hl.dsp.exec_cmd(ipc .. " brightness increment || brightnessctl -n2 set 5%+"), rep)
+hl.bind("XF86MonBrightnessDown", hl.dsp.exec_cmd(ipc .. " brightness decrement || brightnessctl -n2 set 5%-"), rep)
+```
+
+Hook it in with:
+
+```fish
+sed -i 's/    "hyprland.shellOverrides.main",/&\n    "end4.keys",/' ~/.config/hypr/end4/mode.lua
+```
+
+Needs `wpctl`, `playerctl` and `brightnessctl`. If the brightness fallback hits the wrong panel, add `-d <device>` (see `brightnessctl -l`). Use `wev` to see which key name a stuck key sends.
 
 ### Mode file and loader lines
 
@@ -533,6 +598,9 @@ Everything below actually happened during setup.
 | DMS still shown after `dms kill` | systemd restarted `dms.service` | `systemctl --user stop dms` (that is what `shell-switch` does) |
 | Fork and DMS bars overlap | Both running | `shell-switch status`, then switch again |
 | Polkit warning in fork log: "authentication agent already exists" | Another agent is registered | Harmless; your existing agent handles prompts |
+| Fork still running after `shell-switch dms`; `pgrep qs` does not show it | The fork can run as a bare `/usr/bin/quickshell` with no `-c`, so name-based `pkill` misses it | Find it by config path: `qs list --all` (look for `end4-pC/shell.qml`). `shell-switch` now does this |
+| Many `switchwall.sh` and `notify-send` processes hanging for an hour+ | The theme script posts an "Upscale? Image resolution … lower than screen resolution" notification with an action button and waits for an answer | Use a wallpaper at least as large as the screen, or dismiss the notification. `shell-switch` clears leftovers when it stops the fork |
+| `shell-switch` says an update is running | `yay`/`makepkg`/`pacman` was started in a terminal opened by the fork; stopping the fork would kill it | Let it finish, or `env FORCE=1 shell-switch dms` |
 
 ### Keys and menus
 
@@ -541,6 +609,7 @@ Everything below actually happened during setup.
 | Super does not open the fork launcher | No Hyprland bind for `quickshell:*` shortcuts (ii's Hyprland config was skipped) | Add `end4/binds.lua`, then `hyprctl reload` |
 | `hyprctl dispatch …searchToggleRelease` does nothing | That one fires on key *release* | Test with `quickshell:searchToggle` or `overviewWorkspacesToggle` |
 | Unsure the fork registered its shortcuts | | `hyprctl globalshortcuts \| grep quickshell` |
+| F1–F6 (volume, mute, brightness, media keys) do nothing in end4 mode | DMS's binds in `dms/binds.lua` run `dms ipc call …`, which fail while DMS is stopped | `end4/keys.lua` (end4 mode only) rebinds them to `wpctl`, `playerctl` and brightness via the fork's IPC with a `brightnessctl` fallback |
 | Launcher pops up after Super combos (e.g. `Super+T`) | Release-triggered shortcut also fires after combos | Look at `searchToggleReleaseInterrupt` in `~/dots-hyprland/dots/.config/hypr/hyprland/keybinds.lua` |
 
 ### Look and colors
@@ -621,19 +690,49 @@ Reverse with `systemctl --user enable dms`.
 
 ## 🎛 Presets and settings
 
-The Linux fork's README does not describe a preset feature. What exists:
+end4-pC has a **built-in preset gallery**, backed by the community repo [pctrade/end4-pCpresets](https://github.com/pctrade/end4-pCpresets). The shell reads that repo directly; presets are plain files, and nothing runs when you browse.
 
-- **Settings panel:** `Super+Esc` (needs the bind). Changes are written to `~/.config/illogical-impulse/config.json`.
+### Use a preset
+
+Open **Dashboard → Presets** in the shell (the preset repo's README does not say which button opens the Dashboard; look on the bar). Pick a preset, then:
+
+| Button | What it does |
+|---|---|
+| **Download** | Copies the preset to the shell's cache so you can preview its bar, colors and widgets and apply it |
+| **Install** | Keeps it for good: images are copied to your folders and the preset is saved under **My presets** |
+
+Where **Install** puts images (nothing of yours is overwritten; a same-name file with different content gets a short hash suffix):
+
+| Image | Folder |
+|---|---|
+| Wallpapers (main, centered, collage, lock screen) | `~/Pictures/Wallpapers/` |
+| Avatar | `~/Pictures/avatar/` |
+| Everything else (banner, custom image, sticker) | `~/Pictures/preset-assets/` |
+
+Presets installed from the gallery belong to their author and cannot be exported or re-uploaded.
+
+### What a preset contains
+
+Visual settings only. Fonts, language, audio, API keys, accounts, commands and scripts, input settings and personal paths never leave your machine. The repo's validator rejects keys that run commands (`apps`, `custom`, `hacks`, `policies`, `conflictKiller`), absolute paths, URLs and most Hyprland settings. Decoration, gaps, animations and general are allowed.
+
+### Sharing your own
+
+Dashboard → Presets → open your preset → **Upload** → pick a 16:9 preview screenshot (no notifications, names or private windows) → drag the prepared folder into the GitHub upload page → *Propose changes* → *Create pull request*. Everything uploaded is **public**. Details and rules: the [presets README](https://github.com/pctrade/end4-pCpresets#share-your-preset).
+
+### How this interacts with the dual-shell setup
+
+- Presets need internet access (the shell downloads public files from GitHub).
+- Gaps, decoration and animation values from a preset reach Hyprland through the fork's `hyprland/shellOverrides` files, which only load in **`end4` mode** (see `end4/mode.lua`). In `dms` mode they have no effect.
+- Colors still come from the wallpaper via matugen, so after installing a preset, check `head -8 ~/.cache/end4-mode.log` shows `hyprland.colors: ok`.
+- Settings live in `~/.config/illogical-impulse/config.json`, which `end4-repair snapshot` includes. Re-snapshot after you settle on a preset.
+
+### Other ways to change the look
+
+- **Settings panel:** `Super+Esc` (needs the bind in `end4/binds.lua`).
 - **Panel family:** `Ctrl+Super+P` cycles panel families (`quickshell:panelFamilyCycle`).
-- **Wallpaper → theme:** `Ctrl+Super+T`; matugen derives the palette from the wallpaper.
+- **Wallpaper → theme:** `Ctrl+Super+T`.
 
-To check whether your checkout has a preset feature:
-
-```fish
-grep -rli preset ~/.config/quickshell/end4-pC --include='*.qml' --include='*.json' --include='*.sh' | head
-```
-
-A simple home-made preset is a saved copy of `config.json`:
+### Optional: plain local copies of `config.json`
 
 ```fish
 function end4-preset
@@ -650,7 +749,7 @@ end
 funcsave end4-preset
 ```
 
-Usage: `end4-preset save night`, `end4-preset load night`, `end4-preset list`. The shell watches `config.json`, so changes usually apply live; if not, `shell-switch end4`. Colors come from the wallpaper, so re-pick it to regenerate them. `end4-repair snapshot` already includes `config.json`.
+These are private backups, separate from the gallery's presets.
 
 ---
 
